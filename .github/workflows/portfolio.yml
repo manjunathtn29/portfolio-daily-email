@@ -3,7 +3,6 @@ name: Portfolio Mailer
 on:
   schedule:
     # GitHub cron uses UTC
-    - cron: "*/10 * * * *"  # TEMP test
     # OPEN run ~ 09:20 IST => 03:50 UTC
     - cron: "50 3 * * 1-5"
     # CLOSE run ~ 15:35 IST => 10:05 UTC
