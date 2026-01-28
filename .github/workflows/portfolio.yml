@@ -2,7 +2,8 @@ name: Portfolio Mailer
 
 on:
   schedule:
-    # GitHub cron uses UTC.
+    # GitHub cron uses UTC
+    - cron: "*/10 * * * *"  # TEMP test
     # OPEN run ~ 09:20 IST => 03:50 UTC
     - cron: "50 3 * * 1-5"
     # CLOSE run ~ 15:35 IST => 10:05 UTC
@@ -12,6 +13,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,16 +28,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Decide RUN_LABEL based on schedule time
-        id: label
+      # ✅ Robust RUN_LABEL logic
+      - name: Decide RUN_LABEL
         run: |
-          # The schedule triggers at either 03:50 UTC (OPEN) or 10:05 UTC (CLOSE)
-          HOUR=$(date -u +%H)
-          MIN=$(date -u +%M)
-          if [ "$HOUR" = "03" ] && [ "$MIN" = "50" ]; then
-            echo "RUN_LABEL=OPEN" >> $GITHUB_ENV
-          elif [ "$HOUR" = "10" ] && [ "$MIN" = "05" ]; then
-            echo "RUN_LABEL=CLOSE" >> $GITHUB_ENV
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" -lt 6 ]; then
+              echo "RUN_LABEL=OPEN" >> $GITHUB_ENV
+            else
+              echo "RUN_LABEL=CLOSE" >> $GITHUB_ENV
+            fi
           else
             echo "RUN_LABEL=MANUAL" >> $GITHUB_ENV
           fi
@@ -50,5 +52,9 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           TOP_N: "10"
+          # optional alert tuning (defaults already exist in code)
+          ALERT_STREAK_DAYS: "3"
+          ALERT_DRAWDOWN_PCT: "8"
+          ALERT_RUNUP_PCT: "10"
         run: |
           python portfolio_mailer.py
