@@ -2,10 +2,10 @@ name: Portfolio Mailer
 
 on:
   schedule:
-    # GitHub Actions cron is UTC.
-    # 09:20 IST = 03:50 UTC
+    # GitHub cron uses UTC.
+    # OPEN run ~ 09:20 IST => 03:50 UTC
     - cron: "50 3 * * 1-5"
-    # 15:35 IST = 10:05 UTC
+    # CLOSE run ~ 15:35 IST => 10:05 UTC
     - cron: "5 10 * * 1-5"
   workflow_dispatch:
 
@@ -21,21 +21,34 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      - name: Decide RUN_LABEL based on schedule time
+        id: label
+        run: |
+          # The schedule triggers at either 03:50 UTC (OPEN) or 10:05 UTC (CLOSE)
+          HOUR=$(date -u +%H)
+          MIN=$(date -u +%M)
+          if [ "$HOUR" = "03" ] && [ "$MIN" = "50" ]; then
+            echo "RUN_LABEL=OPEN" >> $GITHUB_ENV
+          elif [ "$HOUR" = "10" ] && [ "$MIN" = "05" ]; then
+            echo "RUN_LABEL=CLOSE" >> $GITHUB_ENV
+          else
+            echo "RUN_LABEL=MANUAL" >> $GITHUB_ENV
+          fi
+
+      - name: Run portfolio mailer
         env:
           HOLDINGS_FILE: "holdings.xlsx"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          MAIL_TO:    ${{ secrets.MAIL_TO }}
-          MAIL_FROM:  ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
           TOP_N: "10"
         run: |
           python portfolio_mailer.py
-          
