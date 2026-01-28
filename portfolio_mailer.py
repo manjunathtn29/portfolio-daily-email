@@ -8,11 +8,7 @@ from email.message import EmailMessage
 from html import escape
 
 # ---------- CONFIG ----------
-INPUT_FILE = os.environ.get("HOLDINGS_FILE", "holdings.xlsx")
-
-sym_col = "Symbol"
-qty_col = "Quantity Available"
-avg_col = "Average Price"
+INPUT_FILE = os.environ.get("HOLDINGS_FILE", "holdings.csv")
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -26,12 +22,12 @@ MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)
 TOP_N = int(os.environ.get("TOP_N", "10"))
 RUN_LABEL = os.environ.get("RUN_LABEL", "RUN").strip().upper()
 
-# --- Alert knobs (defaults are sensible; tune later if you want) ---
-ALERT_STREAK_DAYS = int(os.environ.get("ALERT_STREAK_DAYS", "3"))   # continuous up/down days
-ALERT_DRAWDOWN_PCT = float(os.environ.get("ALERT_DRAWDOWN_PCT", "8")) # alert if drawdown <= -8%
-ALERT_RUNUP_PCT = float(os.environ.get("ALERT_RUNUP_PCT", "10"))      # alert if run-up >= +10%
-DRAWDOWN_LOOKBACK = int(os.environ.get("DRAWDOWN_LOOKBACK", "20"))    # days high/low window
-HIST_DAYS = int(os.environ.get("HIST_DAYS", "90"))                    # candles to compute indicators
+# --- Alert knobs ---
+ALERT_STREAK_DAYS = int(os.environ.get("ALERT_STREAK_DAYS", "3"))
+ALERT_DRAWDOWN_PCT = float(os.environ.get("ALERT_DRAWDOWN_PCT", "8"))
+ALERT_RUNUP_PCT = float(os.environ.get("ALERT_RUNUP_PCT", "10"))
+DRAWDOWN_LOOKBACK = int(os.environ.get("DRAWDOWN_LOOKBACK", "20"))
+HIST_DAYS = int(os.environ.get("HIST_DAYS", "90"))
 # ---------------------------
 
 
@@ -54,14 +50,9 @@ def fmt_pct(x):
 
 
 def compute_streak(closes: pd.Series):
-    """
-    Count consecutive up or down days from the most recent close backwards.
-    Returns: (up_streak, down_streak)
-    """
     closes = closes.dropna()
     if len(closes) < 2:
         return 0, 0
-
     up = down = 0
     for i in range(len(closes) - 1, 0, -1):
         if closes.iloc[i] > closes.iloc[i - 1]:
@@ -79,9 +70,12 @@ def compute_streak(closes: pd.Series):
 
 def fetch_symbol_bundle(base_symbol: str):
     """
-    Returns dict with:
-      used_ticker, prev_close, today_price, closes_series (daily close history)
-    - Try NSE: SYMBOL.NS then fallback BSE: SYMBOL.BO
+    Returns dict:
+      used_ticker, prev_close, today_price, closes_series
+
+    - Try NSE (.NS) then BSE (.BO)
+    - prev_close = previous trading day's close
+    - today_price = fast_info.last_price if available else latest close
     """
     base_symbol = str(base_symbol).strip().upper()
     candidates = [f"{base_symbol}.NS", f"{base_symbol}.BO"]
@@ -104,7 +98,6 @@ def fetch_symbol_bundle(base_symbol: str):
     last_close = float(closes.iloc[-1])
     prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else last_close
 
-    # Today price: prefer fast_info.last_price, fallback to last close
     today_price = None
     try:
         fi = yf.Ticker(used).fast_info
@@ -120,82 +113,60 @@ def fetch_symbol_bundle(base_symbol: str):
 
 
 def df_to_html_table(d: pd.DataFrame, title: str, cols: list[str], align_right: set[str]):
-    headers = cols
-
     def cell(v, is_right=False):
         style = "text-align:right;" if is_right else "text-align:left;"
         return f"<td style='{style}'>{escape(str(v))}</td>"
 
     ths = []
-    for h in headers:
+    for h in cols:
         th_style = "text-align:right;" if h in align_right else "text-align:left;"
         ths.append(f"<th style='{th_style}'>{escape(h)}</th>")
 
     rows = []
     for _, r in d.iterrows():
         tds = []
-        for h in headers:
-            val = r.get(h, "")
-            tds.append(cell(val, h in align_right))
+        for h in cols:
+            tds.append(cell(r.get(h, ""), h in align_right))
         rows.append("<tr>" + "".join(tds) + "</tr>")
 
     return f"""
     <h3 style="margin:16px 0 8px 0;">{escape(title)}</h3>
     <table cellpadding="6" cellspacing="0" border="1" style="border-collapse:collapse; font-family:Arial, sans-serif; font-size:13px; width:100%;">
-      <thead>
-        <tr style="background:#f2f2f2;">{''.join(ths)}</tr>
-      </thead>
-      <tbody>
-        {''.join(rows) if rows else "<tr><td colspan='99' style='color:#666;'>No alerts.</td></tr>"}
-      </tbody>
+      <thead><tr style="background:#f2f2f2;">{''.join(ths)}</tr></thead>
+      <tbody>{''.join(rows) if rows else "<tr><td colspan='99' style='color:#666;'>No alerts.</td></tr>"}</tbody>
     </table>
     """
 
 
-def build_email(df: pd.DataFrame, now_ist: datetime):
-    # Top gainers/losers by absolute today's P&L
+def build_email(df: pd.DataFrame, now_ist: datetime, qty_col_name: str):
     losers = df.sort_values("Todays Profit", ascending=True).head(TOP_N)
     gainers = df.sort_values("Todays Profit", ascending=False).head(TOP_N)
 
-    # Attention: only rows with non-empty Alert
     alerts_df = df[df["Alert"].astype(str).str.len() > 0].copy()
 
-    # Make alert table more readable
     alerts_view = alerts_df[[
-        "Symbol",
-        "Trend",
-        "Up Streak",
-        "Down Streak",
-        "Drawdown %",
-        "Run-up %",
-        "Todays Profit",
-        "Todays Profit %",
-        "Total Profit",
-        "Total Profit %",
-        "Alert",
+        "Symbol", "Trend", "Up Streak", "Down Streak", "Drawdown %", "Run-up %",
+        "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %", "Alert",
     ]].copy()
 
-    # Sort alerts by severity (downtrend + drawdown first, then down streak)
-    # crude but effective
     alerts_view["__sev"] = 0
     alerts_view.loc[alerts_view["Trend"].eq("DOWN"), "__sev"] += 2
     alerts_view.loc[alerts_view["Drawdown %"] <= -abs(ALERT_DRAWDOWN_PCT), "__sev"] += 2
     alerts_view.loc[alerts_view["Down Streak"] >= ALERT_STREAK_DAYS, "__sev"] += 1
     alerts_view = alerts_view.sort_values(["__sev", "Drawdown %", "Down Streak"], ascending=[False, True, False]).drop(columns=["__sev"])
 
-    # Format view columns for email
     for c in ["Todays Profit", "Total Profit"]:
         alerts_view[c] = alerts_view[c].apply(fmt_money)
     for c in ["Todays Profit %", "Total Profit %", "Drawdown %", "Run-up %"]:
         alerts_view[c] = alerts_view[c].apply(fmt_pct)
 
-    def format_gainer_loser_block(d: pd.DataFrame, title: str):
+    def format_block(d: pd.DataFrame, title: str):
         view = d[[
-            "Symbol", qty_col, "Previous Closing Price", "Today Price",
-            "Todays Profit", "Todays Profit %",
-            "Total Profit", "Total Profit %"
+            "Symbol", qty_col_name, "Previous Closing Price", "Today Price",
+            "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"
         ]].copy()
-        view[qty_col] = view[qty_col].astype(int)
+
+        view[qty_col_name] = view[qty_col_name].astype(int)
         view["Previous Closing Price"] = view["Previous Closing Price"].apply(fmt_money)
         view["Today Price"] = view["Today Price"].apply(fmt_money)
         view["Todays Profit"] = view["Todays Profit"].apply(fmt_money)
@@ -204,25 +175,25 @@ def build_email(df: pd.DataFrame, now_ist: datetime):
         view["Total Profit %"] = view["Total Profit %"].apply(fmt_pct)
 
         return df_to_html_table(
-            view,
-            title,
-            cols=["Symbol", qty_col, "Previous Closing Price", "Today Price", "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"],
-            align_right={qty_col, "Previous Closing Price", "Today Price", "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"},
+            view, title,
+            cols=["Symbol", qty_col_name, "Previous Closing Price", "Today Price",
+                  "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"],
+            align_right={qty_col_name, "Previous Closing Price", "Today Price",
+                         "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"},
         )
 
-    # Plain-text fallback (minimal)
     text_body = (
         f"Portfolio Update ({RUN_LABEL}) - {now_ist.strftime('%Y-%m-%d %H:%M')} IST\n"
         f"Alerts: {len(alerts_df)}\n"
         f"Top {TOP_N} gainers/losers + full portfolio attached.\n"
     )
 
-    # HTML body
     alerts_table = df_to_html_table(
         alerts_view,
         f"🚨 Attention Required (alerts only) — {len(alerts_view)} stock(s)",
         cols=list(alerts_view.columns),
-        align_right={"Up Streak", "Down Streak", "Drawdown %", "Run-up %", "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"},
+        align_right={"Up Streak", "Down Streak", "Drawdown %", "Run-up %",
+                     "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"},
     )
 
     html_body = f"""
@@ -233,13 +204,11 @@ def build_email(df: pd.DataFrame, now_ist: datetime):
       </p>
 
       {alerts_table}
-
-      {format_gainer_loser_block(losers, f"Top {TOP_N} LOSERS (sorted by Today's P&L ₹)")}
-      {format_gainer_loser_block(gainers, f"Top {TOP_N} GAINERS (sorted by Today's P&L ₹)")}
+      {format_block(losers, f"Top {TOP_N} LOSERS (sorted by Today's P&L ₹)")}
+      {format_block(gainers, f"Top {TOP_N} GAINERS (sorted by Today's P&L ₹)")}
 
       <p style="margin-top:12px; color:#666; font-size:12px;">
         Full portfolio is attached as Excel.
-        Alerts are based on streaks (≥{ALERT_STREAK_DAYS} days), EMA5 vs EMA10 trend, and drawdown/run-up over {DRAWDOWN_LOOKBACK} days.
       </p>
     </div>
     """
@@ -274,22 +243,36 @@ def send_email(subject: str, text_body: str, html_body: str, attachment_path: st
         s.send_message(msg)
 
 
-def main():
-    df = pd.read_excel(INPUT_FILE)
+def read_holdings_csv(path: str):
+    df = pd.read_csv(path)
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")].copy()
 
-    # Clean & types
-    df[sym_col] = df[sym_col].astype(str).str.strip()
-    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
-    df[avg_col] = pd.to_numeric(df[avg_col], errors="coerce").fillna(0)
+    # Zerodha holdings-style CSV like your file:
+    # Instrument | Qty. | Avg. cost | ...
+    required = {"Instrument", "Qty.", "Avg. cost"}
+    if not required.issubset(set(df.columns)):
+        raise ValueError("CSV format not recognized. Expected columns like: Instrument, Qty., Avg. cost")
+
+    df["Symbol"] = df["Instrument"].astype(str).str.strip()
+    qty_col_name = "Qty."
+    avg_col_name = "Avg. cost"
+
+    df[qty_col_name] = pd.to_numeric(df[qty_col_name], errors="coerce").fillna(0)
+    df[avg_col_name] = pd.to_numeric(df[avg_col_name], errors="coerce").fillna(0)
+
+    return df, qty_col_name, avg_col_name
+
+
+def main():
+    df_raw, qty_col_name, avg_col_name = read_holdings_csv(INPUT_FILE)
 
     used_list, prev_list, today_list = [], [], []
     up_streaks, down_streaks = [], []
-    trends = []
-    drawdowns, runups = [], []
-    alerts = []
+    trends, drawdowns, runups, alerts = [], [], [], []
 
-    for sym in df[sym_col]:
+    for sym in df_raw["Symbol"]:
         bundle = fetch_symbol_bundle(sym)
+
         used = bundle["used_ticker"]
         prev_close = bundle["prev_close"]
         today_price = bundle["today_price"]
@@ -299,7 +282,7 @@ def main():
         prev_list.append(prev_close)
         today_list.append(today_price)
 
-        # Defaults if we can't compute indicators
+        # indicators defaults
         up_s = down_s = 0
         trend = "NA"
         dd_pct = 0.0
@@ -307,24 +290,21 @@ def main():
         alert_msgs = []
 
         if closes is not None and closes.dropna().shape[0] >= 15:
-            # Streaks
             up_s, down_s = compute_streak(closes)
 
-            # EMA trend (5 vs 10)
             ema5 = closes.ewm(span=5, adjust=False).mean()
             ema10 = closes.ewm(span=10, adjust=False).mean()
             trend = "UP" if ema5.iloc[-1] > ema10.iloc[-1] else "DOWN" if ema5.iloc[-1] < ema10.iloc[-1] else "FLAT"
 
-            # Drawdown / run-up vs last N days high/low
             window = closes.iloc[-DRAWDOWN_LOOKBACK:] if len(closes) >= DRAWDOWN_LOOKBACK else closes
             rolling_high = float(window.max())
             rolling_low = float(window.min())
             last_close = float(closes.iloc[-1])
 
-            dd_pct = safe_pct(last_close - rolling_high, rolling_high)   # negative when below high
-            ru_pct = safe_pct(last_close - rolling_low, rolling_low)     # positive when above low
+            dd_pct = safe_pct(last_close - rolling_high, rolling_high)   # negative below high
+            ru_pct = safe_pct(last_close - rolling_low, rolling_low)     # positive above low
 
-            # Alert rules (email only)
+            # Alerts
             if down_s >= ALERT_STREAK_DAYS:
                 alert_msgs.append(f"Down {down_s} days")
             if up_s >= ALERT_STREAK_DAYS:
@@ -341,16 +321,17 @@ def main():
         runups.append(ru_pct)
         alerts.append(" | ".join(alert_msgs))
 
+    df = df_raw.copy()
     df["Yahoo Ticker Used"] = used_list
     df["Previous Closing Price"] = pd.to_numeric(prev_list, errors="coerce")
     df["Today Price"] = pd.to_numeric(today_list, errors="coerce")
 
     # P&L absolute
     df["Todays Profit/Share"] = df["Today Price"] - df["Previous Closing Price"]
-    df["Total Profit/Share"] = df["Today Price"] - df[avg_col]
+    df["Total Profit/Share"] = df["Today Price"] - df[avg_col_name]
 
-    df["Todays Profit"] = df["Todays Profit/Share"] * df[qty_col]
-    df["Total Profit"] = df["Total Profit/Share"] * df[qty_col]
+    df["Todays Profit"] = df["Todays Profit/Share"] * df[qty_col_name]
+    df["Total Profit"] = df["Total Profit/Share"] * df[qty_col_name]
 
     # P&L percent
     df["Todays Profit %"] = df.apply(
@@ -358,11 +339,11 @@ def main():
         axis=1,
     )
     df["Total Profit %"] = df.apply(
-        lambda r: safe_pct(r["Today Price"] - r[avg_col], r[avg_col]),
+        lambda r: safe_pct(r["Today Price"] - r[avg_col_name], r[avg_col_name]),
         axis=1,
     )
 
-    # Indicators + Alerts (kept in Excel too, but alerts are used only in email)
+    # Indicators + alerts
     df["Up Streak"] = up_streaks
     df["Down Streak"] = down_streaks
     df["Trend"] = trends
@@ -370,14 +351,13 @@ def main():
     df["Run-up %"] = pd.to_numeric(runups, errors="coerce").round(2)
     df["Alert"] = alerts
 
-    # Rounding for money columns
+    # Rounding
     money_cols = [
-        "Previous Closing Price", "Today Price", avg_col,
+        "Previous Closing Price", "Today Price", avg_col_name,
         "Todays Profit/Share", "Total Profit/Share", "Todays Profit", "Total Profit"
     ]
     for c in money_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
-
     for c in ["Todays Profit %", "Total Profit %"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
 
@@ -386,7 +366,7 @@ def main():
     out_file = f"holdings_updated_{stamp}_{RUN_LABEL}.xlsx"
     df.to_excel(out_file, index=False)
 
-    subject, text_body, html_body = build_email(df, now_ist)
+    subject, text_body, html_body = build_email(df, now_ist, qty_col_name=qty_col_name)
     send_email(subject, text_body, html_body, out_file)
 
     print("Sent:", subject)
