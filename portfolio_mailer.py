@@ -217,7 +217,7 @@ def build_email(df: pd.DataFrame, now_ist: datetime, qty_col_name: str):
     return subject, text_body, html_body
 
 
-def send_email(subject: str, text_body: str, html_body: str, attachment_path: str):
+def send_email(subject: str, text_body: str, html_body: str):
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
@@ -225,17 +225,6 @@ def send_email(subject: str, text_body: str, html_body: str, attachment_path: st
 
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
-
-    with open(attachment_path, "rb") as f:
-        data = f.read()
-
-    filename = os.path.basename(attachment_path)
-    msg.add_attachment(
-        data,
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=filename,
-    )
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
         s.starttls()
@@ -364,10 +353,10 @@ def main():
     now_ist = datetime.now(IST)
     stamp = now_ist.strftime("%Y-%m-%d_%H%M")
     out_file = f"holdings_updated_{stamp}_{RUN_LABEL}.xlsx"
-    df.to_excel(out_file, index=False)
+    # df.to_excel(out_file, index=False)
 
     subject, text_body, html_body = build_email(df, now_ist, qty_col_name=qty_col_name)
-    send_email(subject, text_body, html_body, out_file)
+    send_email(subject, text_body, html_body)
 
     print("Sent:", subject)
     print("Attachment:", out_file)
