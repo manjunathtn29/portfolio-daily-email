@@ -2,11 +2,8 @@ name: Portfolio Mailer
 
 on:
   schedule:
-    # GitHub cron uses UTC
-    # OPEN run ~ 09:20 IST => 03:50 UTC
-    - cron: "50 3 * * 1-5"
-    # CLOSE run ~ 15:35 IST => 10:05 UTC
-    - cron: "5 10 * * 1-5"
+    # Run every 15 minutes on weekdays (more reliable than exact-time cron)
+    - cron: "*/15 * * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -27,21 +24,73 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ Robust RUN_LABEL logic
-      - name: Decide RUN_LABEL
+      - name: Debug trigger + time
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            HOUR=$(date -u +%H)
-            if [ "$HOUR" -lt 6 ]; then
-              echo "RUN_LABEL=OPEN" >> $GITHUB_ENV
-            else
-              echo "RUN_LABEL=CLOSE" >> $GITHUB_ENV
-            fi
+          echo "event=${{ github.event_name }}"
+          echo "utc=$(date -u)"
+          echo "ist=$(TZ=Asia/Kolkata date)"
+          echo "ist_hhmm=$(TZ=Asia/Kolkata date +%H%M)"
+
+      # Decide whether this run should send email
+      - name: Decide RUN_LABEL and gate to target IST windows
+        run: |
+          IST_HHMM=$(TZ=Asia/Kolkata date +%H%M)
+          IST_DATE=$(TZ=Asia/Kolkata date +%Y-%m-%d)
+
+          echo "IST_HHMM=$IST_HHMM"
+          echo "IST_DATE=$IST_DATE"
+
+          # Windows (15-min schedule friendly):
+          # OPEN window: 09:15–09:29 IST
+          # CLOSE window: 15:30–15:44 IST
+          if [ "$IST_HHMM" -ge 0915 ] && [ "$IST_HHMM" -le 0929 ]; then
+            echo "RUN_LABEL=OPEN" >> $GITHUB_ENV
+            echo "SHOULD_RUN=1" >> $GITHUB_ENV
+          elif [ "$IST_HHMM" -ge 1530 ] && [ "$IST_HHMM" -le 1544 ]; then
+            echo "RUN_LABEL=CLOSE" >> $GITHUB_ENV
+            echo "SHOULD_RUN=1" >> $GITHUB_ENV
           else
+            echo "RUN_LABEL=SKIP" >> $GITHUB_ENV
+            echo "SHOULD_RUN=0" >> $GITHUB_ENV
+          fi
+
+          # Manual trigger should always run
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "RUN_LABEL=MANUAL" >> $GITHUB_ENV
+            echo "SHOULD_RUN=1" >> $GITHUB_ENV
+          fi
+
+          echo "Final RUN_LABEL=$RUN_LABEL"
+          echo "Final SHOULD_RUN=$SHOULD_RUN"
+
+      # Prepare a unique marker so email is sent only once per window/day
+      - name: Prepare send marker key
+        if: env.SHOULD_RUN == '1'
+        run: |
+          IST_DATE=$(TZ=Asia/Kolkata date +%Y-%m-%d)
+          echo "MARKER_KEY=sent-${IST_DATE}-${RUN_LABEL}" >> $GITHUB_ENV
+          echo "MARKER_FILE=.sent_marker" >> $GITHUB_ENV
+
+      - name: Restore send marker cache
+        if: env.SHOULD_RUN == '1'
+        id: cache_marker
+        uses: actions/cache@v4
+        with:
+          path: .sent_marker
+          key: ${{ env.MARKER_KEY }}
+
+      - name: Skip if already sent for this window
+        if: env.SHOULD_RUN == '1'
+        run: |
+          if [ -f ".sent_marker" ]; then
+            echo "Already sent for ${MARKER_KEY}. Exiting."
+            echo "SHOULD_RUN=0" >> $GITHUB_ENV
+          else
+            echo "Not sent yet for ${MARKER_KEY}. Proceeding."
           fi
 
       - name: Run portfolio mailer
+        if: env.SHOULD_RUN == '1'
         env:
           HOLDINGS_FILE: "holdings.csv"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -51,9 +100,19 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           TOP_N: "10"
-          # optional alert tuning (defaults already exist in code)
-          ALERT_STREAK_DAYS: "3"
-          ALERT_DRAWDOWN_PCT: "8"
-          ALERT_RUNUP_PCT: "10"
         run: |
           python portfolio_mailer.py
+
+      # Mark this window as sent so we don’t send again today
+      - name: Create send marker
+        if: env.SHOULD_RUN == '1'
+        run: |
+          echo "sent at $(TZ=Asia/Kolkata date)" > .sent_marker
+          cat .sent_marker
+
+      - name: Save send marker cache
+        if: env.SHOULD_RUN == '1'
+        uses: actions/cache@v4
+        with:
+          path: .sent_marker
+          key: ${{ env.MARKER_KEY }}
