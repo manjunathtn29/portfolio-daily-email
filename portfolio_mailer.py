@@ -22,11 +22,11 @@ MAIL_FROM = os.environ.get("MAIL_FROM", SMTP_USER)
 TOP_N = int(os.environ.get("TOP_N", "10"))
 RUN_LABEL = os.environ.get("RUN_LABEL", "RUN").strip().upper()
 
-# Alerts: ONLY continuous down >= 7 trading days
+# Alerts: ONLY continuous down >= 7 trading days (long-term investor, action only on sustained down)
 ALERT_STREAK_DAYS = int(os.environ.get("ALERT_STREAK_DAYS", "7"))
 
-# History needed to compute streak (daily closes)
-HIST_DAYS = int(os.environ.get("HIST_DAYS", "120"))  # ~80-90 trading days typically
+# History needed for streak computation
+HIST_DAYS = int(os.environ.get("HIST_DAYS", "120"))  # gives enough trading days for 7+ streak detection
 # ------------------------------------------------
 
 
@@ -163,16 +163,14 @@ def df_to_html_table(d: pd.DataFrame, title: str, cols: list[str], align_right: 
 
 
 def build_email(df: pd.DataFrame, now_ist: datetime, qty_col: str):
-    # Keep the two tables (top losers + top gainers) always
+    # Always keep top losers/gainers tables
     losers = df.sort_values("Todays Profit", ascending=True).head(TOP_N)
     gainers = df.sort_values("Todays Profit", ascending=False).head(TOP_N)
 
     # Alerts: ONLY continuous down >= ALERT_STREAK_DAYS
     alerts_df = df[df["Down Streak"] >= ALERT_STREAK_DAYS].copy()
-    # Sort by worst streak first, then by today's P&L (more negative first)
     alerts_df = alerts_df.sort_values(["Down Streak", "Todays Profit"], ascending=[False, True])
 
-    # Format alert view
     alerts_view = alerts_df[[
         "Symbol",
         "Down Streak",
@@ -185,7 +183,7 @@ def build_email(df: pd.DataFrame, now_ist: datetime, qty_col: str):
         "Alert",
     ]].copy()
 
-    # Apply formatting for email readability
+    # Format for email
     alerts_view["Previous Closing Price"] = alerts_view["Previous Closing Price"].apply(fmt_money)
     alerts_view["Today Price"] = alerts_view["Today Price"].apply(fmt_money)
     alerts_view["Todays Profit"] = alerts_view["Todays Profit"].apply(fmt_money)
@@ -193,11 +191,10 @@ def build_email(df: pd.DataFrame, now_ist: datetime, qty_col: str):
     alerts_view["Todays Profit %"] = alerts_view["Todays Profit %"].apply(fmt_pct)
     alerts_view["Total Profit %"] = alerts_view["Total Profit %"].apply(fmt_pct)
 
-    def format_gainer_loser_block(d: pd.DataFrame, title: str):
+    def format_block(d: pd.DataFrame, title: str):
         view = d[[
             "Symbol", qty_col, "Previous Closing Price", "Today Price",
-            "Todays Profit", "Todays Profit %",
-            "Total Profit", "Total Profit %"
+            "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"
         ]].copy()
 
         view[qty_col] = view[qty_col].astype(int)
@@ -239,9 +236,8 @@ def build_email(df: pd.DataFrame, now_ist: datetime, qty_col: str):
       </p>
 
       {alerts_table}
-
-      {format_gainer_loser_block(losers, f"Top {TOP_N} LOSERS (sorted by Today's P&L ₹)")}
-      {format_gainer_loser_block(gainers, f"Top {TOP_N} GAINERS (sorted by Today's P&L ₹)")}
+      {format_block(losers, f"Top {TOP_N} LOSERS (sorted by Today's P&L ₹)")}
+      {format_block(gainers, f"Top {TOP_N} GAINERS (sorted by Today's P&L ₹)")}
     </div>
     """
 
@@ -258,8 +254,10 @@ def send_email(subject: str, text_body: str, html_body: str):
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+        s.ehlo()
         s.starttls()
+        s.ehlo()
         s.login(SMTP_USER, SMTP_PASS)
         s.send_message(msg)
 
@@ -281,14 +279,11 @@ def main():
         prev_list.append(prev_close)
         today_list.append(today_price)
 
-        # Continuous down streak computation
         down_s = 0
         if closes is not None and closes.dropna().shape[0] >= 2:
             _, down_s = compute_streak(closes)
 
         down_streaks.append(down_s)
-
-        # Alerts: ONLY down >= threshold
         alerts.append(f"Down {down_s} days" if down_s >= ALERT_STREAK_DAYS else "")
 
     df = df_raw.copy()
@@ -296,14 +291,14 @@ def main():
     df["Previous Closing Price"] = pd.to_numeric(prev_list, errors="coerce")
     df["Today Price"] = pd.to_numeric(today_list, errors="coerce")
 
-    # P&L absolute
+    # Absolute P&L
     df["Todays Profit/Share"] = df["Today Price"] - df["Previous Closing Price"]
     df["Total Profit/Share"] = df["Today Price"] - df[avg_col]
 
     df["Todays Profit"] = df["Todays Profit/Share"] * df[qty_col]
     df["Total Profit"] = df["Total Profit/Share"] * df[qty_col]
 
-    # P&L percent
+    # Percent P&L
     df["Todays Profit %"] = df.apply(
         lambda r: safe_pct(r["Today Price"] - r["Previous Closing Price"], r["Previous Closing Price"]),
         axis=1,
@@ -332,7 +327,8 @@ def main():
 
     # Helpful logs in GitHub Actions
     print("RUN_LABEL:", RUN_LABEL)
-    print("About to send email to:", MAIL_TO)
+    print("MAIL_FROM:", MAIL_FROM)
+    print("MAIL_TO:", MAIL_TO)
     print("Subject:", subject)
 
     send_email(subject, text_body, html_body)
