@@ -2,7 +2,7 @@ name: Portfolio Mailer
 
 on:
   schedule:
-    # Run every 15 minutes on weekdays (more reliable than exact-time cron)
+    # Every 15 minutes on weekdays (reliable) + gate by IST windows
     - cron: "*/15 * * * 1-5"
   workflow_dispatch:
 
@@ -31,7 +31,6 @@ jobs:
           echo "ist=$(TZ=Asia/Kolkata date)"
           echo "ist_hhmm=$(TZ=Asia/Kolkata date +%H%M)"
 
-      # Decide whether this run should send email
       - name: Decide RUN_LABEL and gate to target IST windows
         run: |
           IST_HHMM=$(TZ=Asia/Kolkata date +%H%M)
@@ -40,7 +39,7 @@ jobs:
           echo "IST_HHMM=$IST_HHMM"
           echo "IST_DATE=$IST_DATE"
 
-          # Windows (15-min schedule friendly):
+          # 15-min schedule friendly windows:
           # OPEN window: 09:15–09:29 IST
           # CLOSE window: 15:30–15:44 IST
           if [ "$IST_HHMM" -ge 0915 ] && [ "$IST_HHMM" -le 0929 ]; then
@@ -54,33 +53,30 @@ jobs:
             echo "SHOULD_RUN=0" >> $GITHUB_ENV
           fi
 
-          # Manual trigger should always run
+          # Manual trigger should always run + always send
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "RUN_LABEL=MANUAL" >> $GITHUB_ENV
             echo "SHOULD_RUN=1" >> $GITHUB_ENV
           fi
 
-          echo "Final RUN_LABEL=$RUN_LABEL"
-          echo "Final SHOULD_RUN=$SHOULD_RUN"
-
-      # Prepare a unique marker so email is sent only once per window/day
-      - name: Prepare send marker key
-        if: env.SHOULD_RUN == '1'
+      # ---------- DEDUPE ONLY FOR OPEN/CLOSE ----------
+      - name: Prepare send marker key (OPEN/CLOSE only)
+        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
         run: |
           IST_DATE=$(TZ=Asia/Kolkata date +%Y-%m-%d)
           echo "MARKER_KEY=sent-${IST_DATE}-${RUN_LABEL}" >> $GITHUB_ENV
           echo "MARKER_FILE=.sent_marker" >> $GITHUB_ENV
 
-      - name: Restore send marker cache
-        if: env.SHOULD_RUN == '1'
+      - name: Restore send marker cache (OPEN/CLOSE only)
+        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
         id: cache_marker
         uses: actions/cache@v4
         with:
           path: .sent_marker
           key: ${{ env.MARKER_KEY }}
 
-      - name: Skip if already sent for this window
-        if: env.SHOULD_RUN == '1'
+      - name: Skip if already sent for this window (OPEN/CLOSE only)
+        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
         run: |
           if [ -f ".sent_marker" ]; then
             echo "Already sent for ${MARKER_KEY}. Exiting."
@@ -88,6 +84,7 @@ jobs:
           else
             echo "Not sent yet for ${MARKER_KEY}. Proceeding."
           fi
+      # ------------------------------------------------
 
       - name: Run portfolio mailer
         if: env.SHOULD_RUN == '1'
@@ -100,18 +97,19 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           TOP_N: "10"
+          ALERT_STREAK_DAYS: "7"
         run: |
           python portfolio_mailer.py
 
-      # Mark this window as sent so we don’t send again today
-      - name: Create send marker
-        if: env.SHOULD_RUN == '1'
+      # Save marker only for OPEN/CLOSE so we don't send duplicates in the same day window
+      - name: Create send marker (OPEN/CLOSE only)
+        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
         run: |
           echo "sent at $(TZ=Asia/Kolkata date)" > .sent_marker
           cat .sent_marker
 
-      - name: Save send marker cache
-        if: env.SHOULD_RUN == '1'
+      - name: Save send marker cache (OPEN/CLOSE only)
+        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
         uses: actions/cache@v4
         with:
           path: .sent_marker
