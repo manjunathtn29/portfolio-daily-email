@@ -1,116 +1,35 @@
-name: Portfolio Mailer
+- name: Decide RUN_LABEL and gate to target IST windows
+  run: |
+    IST_HHMM=$(TZ=Asia/Kolkata date +%H%M)
+    echo "IST_HHMM=$IST_HHMM"
 
-on:
-  schedule:
-    # Every 15 minutes on weekdays (reliable) + gate by IST windows
-    - cron: "*/15 * * * 1-5"
-  workflow_dispatch:
+    # Default: don't run
+    echo "RUN_LABEL=SKIP" >> $GITHUB_ENV
+    echo "SHOULD_RUN=0" >> $GITHUB_ENV
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
+    # Manual always runs
+    if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+      echo "RUN_LABEL=MANUAL" >> $GITHUB_ENV
+      echo "SHOULD_RUN=1" >> $GITHUB_ENV
+      exit 0
+    fi
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    # OPEN window: only check during 09:00–10:00 IST
+    # Send once time is >= 09:20 IST
+    if [ "$IST_HHMM" -ge 0900 ] && [ "$IST_HHMM" -le 1000 ]; then
+      if [ "$IST_HHMM" -ge 0920 ]; then
+        echo "RUN_LABEL=OPEN" >> $GITHUB_ENV
+        echo "SHOULD_RUN=1" >> $GITHUB_ENV
+      fi
+      exit 0
+    fi
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Debug trigger + time
-        run: |
-          echo "event=${{ github.event_name }}"
-          echo "utc=$(date -u)"
-          echo "ist=$(TZ=Asia/Kolkata date)"
-          echo "ist_hhmm=$(TZ=Asia/Kolkata date +%H%M)"
-
-      - name: Decide RUN_LABEL and gate to target IST windows
-        run: |
-          IST_HHMM=$(TZ=Asia/Kolkata date +%H%M)
-          IST_DATE=$(TZ=Asia/Kolkata date +%Y-%m-%d)
-
-          echo "IST_HHMM=$IST_HHMM"
-          echo "IST_DATE=$IST_DATE"
-
-          # 15-min schedule friendly windows:
-          # OPEN window: 09:15–09:29 IST
-          # CLOSE window: 15:30–15:44 IST
-          if [ "$IST_HHMM" -ge 0915 ] && [ "$IST_HHMM" -le 0929 ]; then
-            echo "RUN_LABEL=OPEN" >> $GITHUB_ENV
-            echo "SHOULD_RUN=1" >> $GITHUB_ENV
-          elif [ "$IST_HHMM" -ge 1530 ] && [ "$IST_HHMM" -le 1544 ]; then
-            echo "RUN_LABEL=CLOSE" >> $GITHUB_ENV
-            echo "SHOULD_RUN=1" >> $GITHUB_ENV
-          else
-            echo "RUN_LABEL=SKIP" >> $GITHUB_ENV
-            echo "SHOULD_RUN=0" >> $GITHUB_ENV
-          fi
-
-          # Manual trigger should always run + always send
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "RUN_LABEL=MANUAL" >> $GITHUB_ENV
-            echo "SHOULD_RUN=1" >> $GITHUB_ENV
-          fi
-
-      # ---------- DEDUPE ONLY FOR OPEN/CLOSE ----------
-      - name: Prepare send marker key (OPEN/CLOSE only)
-        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
-        run: |
-          IST_DATE=$(TZ=Asia/Kolkata date +%Y-%m-%d)
-          echo "MARKER_KEY=sent-${IST_DATE}-${RUN_LABEL}" >> $GITHUB_ENV
-          echo "MARKER_FILE=.sent_marker" >> $GITHUB_ENV
-
-      - name: Restore send marker cache (OPEN/CLOSE only)
-        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
-        id: cache_marker
-        uses: actions/cache@v4
-        with:
-          path: .sent_marker
-          key: ${{ env.MARKER_KEY }}
-
-      - name: Skip if already sent for this window (OPEN/CLOSE only)
-        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
-        run: |
-          if [ -f ".sent_marker" ]; then
-            echo "Already sent for ${MARKER_KEY}. Exiting."
-            echo "SHOULD_RUN=0" >> $GITHUB_ENV
-          else
-            echo "Not sent yet for ${MARKER_KEY}. Proceeding."
-          fi
-      # ------------------------------------------------
-
-      - name: Run portfolio mailer
-        if: env.SHOULD_RUN == '1'
-        env:
-          HOLDINGS_FILE: "holdings.csv"
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-          MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          TOP_N: "10"
-          ALERT_STREAK_DAYS: "7"
-        run: |
-          python portfolio_mailer.py
-
-      # Save marker only for OPEN/CLOSE so we don't send duplicates in the same day window
-      - name: Create send marker (OPEN/CLOSE only)
-        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
-        run: |
-          echo "sent at $(TZ=Asia/Kolkata date)" > .sent_marker
-          cat .sent_marker
-
-      - name: Save send marker cache (OPEN/CLOSE only)
-        if: env.SHOULD_RUN == '1' && env.RUN_LABEL != 'MANUAL'
-        uses: actions/cache@v4
-        with:
-          path: .sent_marker
-          key: ${{ env.MARKER_KEY }}
+    # CLOSE window: only check during 15:00–16:00 IST
+    # Send once time is >= 15:20 IST
+    if [ "$IST_HHMM" -ge 1500 ] && [ "$IST_HHMM" -le 1600 ]; then
+      if [ "$IST_HHMM" -ge 1520 ]; then
+        echo "RUN_LABEL=CLOSE" >> $GITHUB_ENV
+        echo "SHOULD_RUN=1" >> $GITHUB_ENV
+      fi
+      exit 0
+    fi
