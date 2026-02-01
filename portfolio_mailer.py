@@ -116,26 +116,77 @@ def fetch_symbol_bundle(base_symbol: str):
     return {"used_ticker": used, "prev_close": prev_close, "today_price": today_price, "closes": closes}
 
 
-def read_holdings_csv(path: str):
+def _normalize_columns(df: pd.DataFrame) -> dict:
     """
-    Expects Zerodha-like holdings CSV with at least:
-      Instrument, Qty., Avg. cost
+    Map normalized column name -> original column name
     """
-    df = pd.read_csv(path)
-    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")].copy()
+    m = {}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        m[key] = c
+    return m
 
-    required = {"Instrument", "Qty.", "Avg. cost"}
-    if not required.issubset(set(df.columns)):
-        raise ValueError("CSV format not recognized. Expected columns: Instrument, Qty., Avg. cost")
 
-    df["Symbol"] = df["Instrument"].astype(str).str.strip()
-    qty_col = "Qty."
-    avg_col = "Avg. cost"
+def read_holdings(path: str):
+    """
+    Supports BOTH:
+    1) New Excel format (like your holdings-RM6481.xlsx):
+       - Symbol
+       - Sector (optional)
+       - Quantity Available
+       - Average Price
 
-    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
-    df[avg_col] = pd.to_numeric(df[avg_col], errors="coerce").fillna(0)
+    2) Zerodha-like CSV:
+       - Instrument
+       - Qty.
+       - Avg. cost
+    """
+    ext = os.path.splitext(path)[1].lower()
 
-    return df, qty_col, avg_col
+    if ext in [".xlsx", ".xls"]:
+        df = pd.read_excel(path)
+    elif ext == ".csv":
+        df = pd.read_csv(path)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}. Use .xlsx or .csv")
+
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed", case=False)].copy()
+    colmap = _normalize_columns(df)
+
+    # Symbol column
+    if "symbol" in colmap:
+        symbol_col = colmap["symbol"]
+    elif "instrument" in colmap:
+        symbol_col = colmap["instrument"]
+    else:
+        raise ValueError("Could not find Symbol/Instrument column in holdings file.")
+
+    # Quantity column
+    if "quantity available" in colmap:
+        qty_col = colmap["quantity available"]
+    elif "qty." in colmap:
+        qty_col = colmap["qty."]
+    elif "qty" in colmap:
+        qty_col = colmap["qty"]
+    else:
+        raise ValueError("Could not find Quantity Available / Qty. column in holdings file.")
+
+    # Average price column
+    if "average price" in colmap:
+        avg_col = colmap["average price"]
+    elif "avg. cost" in colmap:
+        avg_col = colmap["avg. cost"]
+    elif "average cost" in colmap:
+        avg_col = colmap["average cost"]
+    else:
+        raise ValueError("Could not find Average Price / Avg. cost column in holdings file.")
+
+    out = df.copy()
+    out["Symbol"] = out[symbol_col].astype(str).str.strip()
+    out[qty_col] = pd.to_numeric(out[qty_col], errors="coerce").fillna(0)
+    out[avg_col] = pd.to_numeric(out[avg_col], errors="coerce").fillna(0)
+
+    return out, qty_col, avg_col
 
 
 def df_to_html_table(d: pd.DataFrame, title: str, cols: list[str], align_right: set[str]):
@@ -163,11 +214,9 @@ def df_to_html_table(d: pd.DataFrame, title: str, cols: list[str], align_right: 
 
 
 def build_email(df: pd.DataFrame, now_ist: datetime, qty_col: str):
-    # Always keep top losers/gainers tables
     losers = df.sort_values("Todays Profit", ascending=True).head(TOP_N)
     gainers = df.sort_values("Todays Profit", ascending=False).head(TOP_N)
 
-    # Alerts: ONLY continuous down >= ALERT_STREAK_DAYS
     alerts_df = df[df["Down Streak"] >= ALERT_STREAK_DAYS].copy()
     alerts_df = alerts_df.sort_values(["Down Streak", "Todays Profit"], ascending=[False, True])
 
@@ -183,7 +232,6 @@ def build_email(df: pd.DataFrame, now_ist: datetime, qty_col: str):
         "Alert",
     ]].copy()
 
-    # Format for email
     alerts_view["Previous Closing Price"] = alerts_view["Previous Closing Price"].apply(fmt_money)
     alerts_view["Today Price"] = alerts_view["Today Price"].apply(fmt_money)
     alerts_view["Todays Profit"] = alerts_view["Todays Profit"].apply(fmt_money)
@@ -197,7 +245,9 @@ def build_email(df: pd.DataFrame, now_ist: datetime, qty_col: str):
             "Todays Profit", "Todays Profit %", "Total Profit", "Total Profit %"
         ]].copy()
 
-        view[qty_col] = view[qty_col].astype(int)
+        # Quantity may be float in excel, but we want integer display
+        view[qty_col] = pd.to_numeric(view[qty_col], errors="coerce").fillna(0).astype(int)
+
         view["Previous Closing Price"] = view["Previous Closing Price"].apply(fmt_money)
         view["Today Price"] = view["Today Price"].apply(fmt_money)
         view["Todays Profit"] = view["Todays Profit"].apply(fmt_money)
@@ -263,7 +313,7 @@ def send_email(subject: str, text_body: str, html_body: str):
 
 
 def main():
-    df_raw, qty_col, avg_col = read_holdings_csv(INPUT_FILE)
+    df_raw, qty_col, avg_col = read_holdings(INPUT_FILE)
 
     used_list, prev_list, today_list = [], [], []
     down_streaks, alerts = [], []
@@ -308,31 +358,20 @@ def main():
         axis=1,
     )
 
-    # Down-only alert fields
     df["Down Streak"] = down_streaks
     df["Alert"] = alerts
 
-    # Rounding
-    money_cols = [
-        "Previous Closing Price", "Today Price", avg_col,
-        "Todays Profit/Share", "Total Profit/Share", "Todays Profit", "Total Profit"
-    ]
-    for c in money_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
-    for c in ["Todays Profit %", "Total Profit %"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
-
+    # Logs for debugging in Actions
     now_ist = datetime.now(IST)
-    subject, text_body, html_body = build_email(df, now_ist, qty_col=qty_col)
-
-    # Helpful logs in GitHub Actions
     print("RUN_LABEL:", RUN_LABEL)
+    print("Holdings file:", INPUT_FILE)
+    print("Symbols:", len(df))
     print("MAIL_FROM:", MAIL_FROM)
     print("MAIL_TO:", MAIL_TO)
-    print("Subject:", subject)
+    print("Time IST:", now_ist.strftime("%Y-%m-%d %H:%M"))
 
+    subject, text_body, html_body = build_email(df, now_ist, qty_col=qty_col)
     send_email(subject, text_body, html_body)
-
     print("Email sent successfully.")
 
 
