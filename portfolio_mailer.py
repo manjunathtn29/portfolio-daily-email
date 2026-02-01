@@ -27,6 +27,12 @@ ALERT_STREAK_DAYS = int(os.environ.get("ALERT_STREAK_DAYS", "7"))
 
 # Enough history for streak detection
 HIST_DAYS = int(os.environ.get("HIST_DAYS", "120"))
+
+# Common symbol aliases / corrections
+ALIASES = {
+    "SILVERBEE": "SILVERBEES",
+    "GOLDBEE": "GOLDBEES",
+}
 # ------------------------------------------------
 
 
@@ -44,7 +50,12 @@ def normalize_symbol(sym: str) -> str:
     if s.startswith("BSE:"):
         s = s[4:]
 
-    return s.replace(" ", "")
+    s = s.replace(" ", "")
+
+    # Apply alias
+    s = ALIASES.get(s, s)
+
+    return s
 
 
 def safe_pct(numerator, denominator):
@@ -53,7 +64,7 @@ def safe_pct(numerator, denominator):
     return float(numerator) / float(denominator) * 100.0
 
 
-def compute_streak(closes: pd.Series):
+def compute_down_streak(closes: pd.Series) -> int:
     closes = closes.dropna()
     if len(closes) < 2:
         return 0
@@ -68,6 +79,10 @@ def compute_streak(closes: pd.Series):
 
 
 def fetch_symbol_bundle(symbol_raw: str):
+    """
+    Returns: used_ticker, prev_close, today_price, closes_series
+    Tries: base, base.NS, base.BO
+    """
     base = normalize_symbol(symbol_raw)
 
     candidates = []
@@ -85,52 +100,55 @@ def fetch_symbol_bundle(symbol_raw: str):
         try:
             t = yf.Ticker(tk)
             h = t.history(period=f"{HIST_DAYS}d", interval="1d")
-            if h is not None and not h.empty and h["Close"].dropna().shape[0] >= 2:
+            if h is not None and not h.empty and "Close" in h.columns and h["Close"].dropna().shape[0] >= 2:
                 used = tk
                 hist = h
                 break
         except Exception:
             continue
 
-    if used is None:
+    if used is None or hist is None:
         return None, None, None, None
 
     closes = hist["Close"].dropna()
     prev_close = float(closes.iloc[-2])
-    today_price = None
 
+    today_price = None
     try:
         fi = yf.Ticker(used).fast_info
-        today_price = fi.get("last_price")
+        lp = fi.get("last_price", None)
+        if lp is not None:
+            today_price = float(lp)
     except Exception:
         pass
 
+    # Fallback to last close if fast_info missing
     if today_price is None:
         today_price = float(closes.iloc[-1])
 
     return used, prev_close, today_price, closes
 
 
-def read_holdings(path: str):
+def read_holdings_excel(path: str):
+    """
+    Expects columns (as in holdings-RM6481.xlsx):
+      Symbol, Sector, Quantity Available, Average Price
+    """
     df = pd.read_excel(path)
     df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed", case=False)].copy()
 
+    if "Symbol" not in df.columns:
+        raise ValueError("Excel file must contain a 'Symbol' column.")
+    if "Quantity Available" not in df.columns:
+        raise ValueError("Excel file must contain 'Quantity Available' column.")
+    if "Average Price" not in df.columns:
+        raise ValueError("Excel file must contain 'Average Price' column.")
+
     df["Symbol"] = df["Symbol"].apply(normalize_symbol)
-    qty_col = "Quantity Available"
-    avg_col = "Average Price"
+    df["Quantity Available"] = pd.to_numeric(df["Quantity Available"], errors="coerce").fillna(0)
+    df["Average Price"] = pd.to_numeric(df["Average Price"], errors="coerce").fillna(0)
 
-    df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
-    df[avg_col] = pd.to_numeric(df[avg_col], errors="coerce").fillna(0)
-
-    return df, qty_col, avg_col
-
-
-def fmt_money(x):
-    return "" if pd.isna(x) else f"{x:,.2f}"
-
-
-def fmt_pct(x):
-    return "" if pd.isna(x) else f"{x:.2f}%"
+    return df
 
 
 def df_to_html_table(d, title, cols, align_right):
@@ -139,7 +157,7 @@ def df_to_html_table(d, title, cols, align_right):
         tds = []
         for c in cols:
             align = "right" if c in align_right else "left"
-            tds.append(f"<td style='text-align:{align}'>{escape(str(r[c]))}</td>")
+            tds.append(f"<td style='text-align:{align}'>{escape(str(r.get(c, '')))}</td>")
         rows.append("<tr>" + "".join(tds) + "</tr>")
 
     ths = []
@@ -157,7 +175,7 @@ def df_to_html_table(d, title, cols, align_right):
 
 
 def main():
-    df_raw, qty_col, avg_col = read_holdings(INPUT_FILE)
+    df_raw = read_holdings_excel(INPUT_FILE)
 
     used_tickers = []
     prev_closes = []
@@ -173,13 +191,16 @@ def main():
         if closes is None:
             down_streaks.append(0)
         else:
-            down_streaks.append(compute_streak(closes))
+            down_streaks.append(compute_down_streak(closes))
 
     df = df_raw.copy()
     df["Yahoo Ticker Used"] = used_tickers
-    df["Previous Close"] = prev_closes
-    df["Today Price"] = today_prices
+    df["Previous Close"] = pd.to_numeric(prev_closes, errors="coerce")
+    df["Today Price"] = pd.to_numeric(today_prices, errors="coerce")
     df["Down Streak"] = down_streaks
+
+    qty_col = "Quantity Available"
+    avg_col = "Average Price"
 
     df["Todays Profit"] = (df["Today Price"] - df["Previous Close"]) * df[qty_col]
     df["Total Profit"] = (df["Today Price"] - df[avg_col]) * df[qty_col]
@@ -191,32 +212,50 @@ def main():
         lambda r: safe_pct(r["Today Price"] - r[avg_col], r[avg_col]), axis=1
     )
 
-    # -------- TABLES --------
+    # ---------- TABLES ----------
     alerts = df[df["Down Streak"] >= ALERT_STREAK_DAYS].copy()
-    alerts = alerts.sort_values("Down Streak", ascending=False)
+    alerts = alerts.sort_values(["Down Streak", "Todays Profit"], ascending=[False, True])
 
-    losers = df.sort_values("Todays Profit").head(TOP_N)
-    gainers = df.sort_values("Todays Profit", ascending=False).head(TOP_N)
+    # Ensure losers/gainers sorting doesn't hide NaNs:
+    df_sort = df.copy()
+    df_sort["Todays Profit"] = pd.to_numeric(df_sort["Todays Profit"], errors="coerce")
+    losers = df_sort.sort_values("Todays Profit", ascending=True, na_position="last").head(TOP_N)
+    gainers = df_sort.sort_values("Todays Profit", ascending=False, na_position="last").head(TOP_N)
 
-    missing = df[df["Yahoo Ticker Used"].isna()][["Symbol"]].copy()
+    # Missing data should include any unresolved prices, not just missing ticker
+    missing = df[
+        df["Yahoo Ticker Used"].isna()
+        | df["Previous Close"].isna()
+        | df["Today Price"].isna()
+    ][["Symbol", "Yahoo Ticker Used", "Previous Close", "Today Price"]].copy()
+
+    # Debug: show SILVER-related rows in Actions logs
+    dbg = df[df["Symbol"].str.contains("SILVER", na=False)]
+    if not dbg.empty:
+        print("DEBUG SILVER ROWS:")
+        print(dbg[["Symbol", "Yahoo Ticker Used", "Previous Close", "Today Price", "Todays Profit"]].to_string(index=False))
 
     now = datetime.now(IST)
     subject = f"Portfolio Update ({RUN_LABEL}) - {now:%Y-%m-%d %H:%M} IST"
 
     html = f"""
-    <p><b>{subject}</b></p>
+    <p><b>{escape(subject)}</b></p>
 
-    {df_to_html_table(alerts, f"🚨 Continuous Down ≥ {ALERT_STREAK_DAYS} Days",
-      ["Symbol","Down Streak","Todays Profit","Total Profit"], {"Down Streak","Todays Profit","Total Profit"})}
+    {df_to_html_table(alerts, f"🚨 Action Required: Continuous Down ≥ {ALERT_STREAK_DAYS} Days",
+      ["Symbol","Down Streak","Todays Profit","Todays Profit %","Total Profit","Total Profit %"],
+      {"Down Streak","Todays Profit","Todays Profit %","Total Profit","Total Profit %"})}
 
-    {df_to_html_table(losers, "Top 10 Losers (Today)",
-      ["Symbol","Todays Profit","Total Profit"], {"Todays Profit","Total Profit"})}
+    {df_to_html_table(losers, f"Top {TOP_N} Losers (Today)",
+      ["Symbol","Todays Profit","Todays Profit %","Total Profit","Total Profit %"],
+      {"Todays Profit","Todays Profit %","Total Profit","Total Profit %"})}
 
-    {df_to_html_table(gainers, "Top 10 Gainers (Today)",
-      ["Symbol","Todays Profit","Total Profit"], {"Todays Profit","Total Profit"})}
+    {df_to_html_table(gainers, f"Top {TOP_N} Gainers (Today)",
+      ["Symbol","Todays Profit","Todays Profit %","Total Profit","Total Profit %"],
+      {"Todays Profit","Todays Profit %","Total Profit","Total Profit %"})}
 
-    {df_to_html_table(missing, "⚠ Missing Price Data (Needs Fix)",
-      ["Symbol"], set()) if not missing.empty else ""}
+    {df_to_html_table(missing, "⚠ Missing / Invalid Price Data (Needs Fix)",
+      ["Symbol","Yahoo Ticker Used","Previous Close","Today Price"],
+      {"Previous Close","Today Price"}) if not missing.empty else ""}
     """
 
     msg = EmailMessage()
@@ -225,6 +264,12 @@ def main():
     msg["Subject"] = subject
     msg.set_content("Please view this email in HTML format.")
     msg.add_alternative(html, subtype="html")
+
+    print("RUN_LABEL:", RUN_LABEL)
+    print("Holdings file:", INPUT_FILE)
+    print("Rows:", len(df))
+    print("MAIL_FROM:", MAIL_FROM)
+    print("MAIL_TO:", MAIL_TO)
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
         s.starttls()
