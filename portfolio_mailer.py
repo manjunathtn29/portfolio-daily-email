@@ -64,6 +64,14 @@ def safe_pct(numerator, denominator):
     return float(numerator) / float(denominator) * 100.0
 
 
+def fmt_money(x):
+    return "" if pd.isna(x) else f"{float(x):,.2f}"
+
+
+def fmt_pct(x):
+    return "" if pd.isna(x) else f"{float(x):.2f}%"
+
+
 def compute_down_streak(closes: pd.Series) -> int:
     closes = closes.dropna()
     if len(closes) < 2:
@@ -131,18 +139,16 @@ def fetch_symbol_bundle(symbol_raw: str):
 
 def read_holdings_excel(path: str):
     """
-    Expects columns (as in holdings-RM6481.xlsx):
-      Symbol, Sector, Quantity Available, Average Price
+    Expects columns:
+      Symbol, Quantity Available, Average Price
     """
     df = pd.read_excel(path)
     df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed", case=False)].copy()
 
-    if "Symbol" not in df.columns:
-        raise ValueError("Excel file must contain a 'Symbol' column.")
-    if "Quantity Available" not in df.columns:
-        raise ValueError("Excel file must contain 'Quantity Available' column.")
-    if "Average Price" not in df.columns:
-        raise ValueError("Excel file must contain 'Average Price' column.")
+    required = {"Symbol", "Quantity Available", "Average Price"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Excel file missing required column(s): {sorted(missing)}")
 
     df["Symbol"] = df["Symbol"].apply(normalize_symbol)
     df["Quantity Available"] = pd.to_numeric(df["Quantity Available"], errors="coerce").fillna(0)
@@ -202,38 +208,68 @@ def main():
     qty_col = "Quantity Available"
     avg_col = "Average Price"
 
+    # Absolute P&L
     df["Todays Profit"] = (df["Today Price"] - df["Previous Close"]) * df[qty_col]
-    df["Total Profit"] = (df["Today Price"] - df[avg_col]) * df[qty_col]
 
+    # Rename to Total P&L (covers both gains and losses)
+    df["Total P&L"] = (df["Today Price"] - df[avg_col]) * df[qty_col]
+
+    # Percent P&L
     df["Todays Profit %"] = df.apply(
         lambda r: safe_pct(r["Today Price"] - r["Previous Close"], r["Previous Close"]), axis=1
     )
-    df["Total Profit %"] = df.apply(
+    df["Total P&L %"] = df.apply(
         lambda r: safe_pct(r["Today Price"] - r[avg_col], r[avg_col]), axis=1
     )
 
-    # ---------- TABLES ----------
+    # ---------- TABLES (use numeric values for sorting) ----------
     alerts = df[df["Down Streak"] >= ALERT_STREAK_DAYS].copy()
     alerts = alerts.sort_values(["Down Streak", "Todays Profit"], ascending=[False, True])
 
-    # Ensure losers/gainers sorting doesn't hide NaNs:
-    df_sort = df.copy()
-    df_sort["Todays Profit"] = pd.to_numeric(df_sort["Todays Profit"], errors="coerce")
-    losers = df_sort.sort_values("Todays Profit", ascending=True, na_position="last").head(TOP_N)
-    gainers = df_sort.sort_values("Todays Profit", ascending=False, na_position="last").head(TOP_N)
+    losers = df.sort_values("Todays Profit", ascending=True, na_position="last").head(TOP_N)
+    gainers = df.sort_values("Todays Profit", ascending=False, na_position="last").head(TOP_N)
 
-    # Missing data should include any unresolved prices, not just missing ticker
-    missing = df[
+    # Missing data: include any unresolved prices, not just missing ticker
+    missing_price = df[
         df["Yahoo Ticker Used"].isna()
         | df["Previous Close"].isna()
         | df["Today Price"].isna()
     ][["Symbol", "Yahoo Ticker Used", "Previous Close", "Today Price"]].copy()
 
-    # Debug: show SILVER-related rows in Actions logs
+    # ---------- FORMAT FOR DISPLAY (2 decimals everywhere) ----------
+    def format_for_display(view: pd.DataFrame) -> pd.DataFrame:
+        out = view.copy()
+        for c in ["Todays Profit", "Total P&L"]:
+            if c in out.columns:
+                out[c] = out[c].apply(fmt_money)
+        for c in ["Todays Profit %", "Total P&L %"]:
+            if c in out.columns:
+                out[c] = out[c].apply(fmt_pct)
+        # also format prices if present
+        for c in ["Previous Close", "Today Price"]:
+            if c in out.columns:
+                out[c] = out[c].apply(fmt_money)
+        return out
+
+    alerts_view = format_for_display(
+        alerts[["Symbol", "Down Streak", "Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"]]
+    )
+    losers_view = format_for_display(
+        losers[["Symbol", "Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"]]
+    )
+    gainers_view = format_for_display(
+        gainers[["Symbol", "Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"]]
+    )
+    missing_view = missing_price.copy()
+    if not missing_view.empty:
+        missing_view["Previous Close"] = missing_view["Previous Close"].apply(fmt_money)
+        missing_view["Today Price"] = missing_view["Today Price"].apply(fmt_money)
+
+    # Debug: show SILVER rows in Actions logs
     dbg = df[df["Symbol"].str.contains("SILVER", na=False)]
     if not dbg.empty:
         print("DEBUG SILVER ROWS:")
-        print(dbg[["Symbol", "Yahoo Ticker Used", "Previous Close", "Today Price", "Todays Profit"]].to_string(index=False))
+        print(dbg[["Symbol", "Yahoo Ticker Used", "Previous Close", "Today Price", "Todays Profit", "Total P&L"]].to_string(index=False))
 
     now = datetime.now(IST)
     subject = f"Portfolio Update ({RUN_LABEL}) - {now:%Y-%m-%d %H:%M} IST"
@@ -241,21 +277,33 @@ def main():
     html = f"""
     <p><b>{escape(subject)}</b></p>
 
-    {df_to_html_table(alerts, f"🚨 Action Required: Continuous Down ≥ {ALERT_STREAK_DAYS} Days",
-      ["Symbol","Down Streak","Todays Profit","Todays Profit %","Total Profit","Total Profit %"],
-      {"Down Streak","Todays Profit","Todays Profit %","Total Profit","Total Profit %"})}
+    {df_to_html_table(
+        alerts_view,
+        f"🚨 Action Required: Continuous Down ≥ {ALERT_STREAK_DAYS} Days",
+        ["Symbol", "Down Streak", "Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"],
+        {"Down Streak", "Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"},
+    )}
 
-    {df_to_html_table(losers, f"Top {TOP_N} Losers (Today)",
-      ["Symbol","Todays Profit","Todays Profit %","Total Profit","Total Profit %"],
-      {"Todays Profit","Todays Profit %","Total Profit","Total Profit %"})}
+    {df_to_html_table(
+        losers_view,
+        f"Top {TOP_N} Losers (Today)",
+        ["Symbol", "Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"],
+        {"Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"},
+    )}
 
-    {df_to_html_table(gainers, f"Top {TOP_N} Gainers (Today)",
-      ["Symbol","Todays Profit","Todays Profit %","Total Profit","Total Profit %"],
-      {"Todays Profit","Todays Profit %","Total Profit","Total Profit %"})}
+    {df_to_html_table(
+        gainers_view,
+        f"Top {TOP_N} Gainers (Today)",
+        ["Symbol", "Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"],
+        {"Todays Profit", "Todays Profit %", "Total P&L", "Total P&L %"},
+    )}
 
-    {df_to_html_table(missing, "⚠ Missing / Invalid Price Data (Needs Fix)",
-      ["Symbol","Yahoo Ticker Used","Previous Close","Today Price"],
-      {"Previous Close","Today Price"}) if not missing.empty else ""}
+    {df_to_html_table(
+        missing_view,
+        "⚠ Missing / Invalid Price Data (Needs Fix)",
+        ["Symbol", "Yahoo Ticker Used", "Previous Close", "Today Price"],
+        {"Previous Close", "Today Price"},
+    ) if not missing_view.empty else ""}
     """
 
     msg = EmailMessage()
@@ -265,6 +313,7 @@ def main():
     msg.set_content("Please view this email in HTML format.")
     msg.add_alternative(html, subtype="html")
 
+    # Logs for Actions
     print("RUN_LABEL:", RUN_LABEL)
     print("Holdings file:", INPUT_FILE)
     print("Rows:", len(df))
