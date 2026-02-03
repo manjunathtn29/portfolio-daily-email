@@ -1,4 +1,4 @@
-name: Portfolio Mailer (Manual)
+name: Portfolio Analyser (Manual)
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run portfolio mailer
+      - name: Run portfolio analyser
         env:
           HOLDINGS_FILE: "holdings-RM6481.xlsx"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
