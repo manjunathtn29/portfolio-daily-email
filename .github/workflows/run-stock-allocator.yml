@@ -1,4 +1,4 @@
-name: Run Portfolio Opportunity Allocator (Manual)
+name: Run Portfolio  Allocator
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -21,8 +21,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run opportunity allocator
+      - name: Run allocator and email result
         env:
           HOLDINGS_FILE: "holdings-RM6481.xlsx"
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          PANIC_STREAK_DAYS: "7"
         run: |
-          python portfolio_opportunity_allocator.py
+          python portfolio_allocator.py
