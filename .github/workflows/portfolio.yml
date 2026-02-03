@@ -1,4 +1,4 @@
-name: Portfolio Analyser (Manual)
+name: Portfolio Analyser
 
 on:
   workflow_dispatch:
