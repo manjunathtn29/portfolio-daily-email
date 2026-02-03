@@ -1,4 +1,4 @@
-name: Run Portfolio  Allocator
+name: Run Portfolio Allocator
 
 on:
   workflow_dispatch:
@@ -23,13 +23,15 @@ jobs:
 
       - name: Run allocator and email result
         env:
-          HOLDINGS_FILE: "holdings-RM6481.xlsx"
+          UNIVERSE_FILE: "Top 60.xlsx"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          TOP_N: "10"
           PANIC_STREAK_DAYS: "7"
+          HIST_DAYS: "120"
         run: |
           python portfolio_allocator.py
