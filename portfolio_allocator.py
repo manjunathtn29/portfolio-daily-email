@@ -86,17 +86,48 @@ def normalize_symbol(sym: str) -> str:
 
 def read_universe(path: str) -> list[str]:
     df = pd.read_excel(path)
-    if "Symbol" not in df.columns:
-        raise ValueError("Universe file must contain a column named 'Symbol'")
 
-    syms = (
-        df["Symbol"]
+    # Drop completely empty columns
+    df = df.dropna(axis=1, how="all")
+
+    # Normalize column names for matching
+    col_map = {c.lower().strip(): c for c in df.columns}
+
+    # Try common column names
+    preferred_cols = [
+        "symbol",
+        "stock",
+        "stock name",
+        "name",
+        "ticker",
+    ]
+
+    symbol_col = None
+    for key in preferred_cols:
+        if key in col_map:
+            symbol_col = col_map[key]
+            break
+
+    # If still not found, fall back to first column
+    if symbol_col is None:
+        symbol_col = df.columns[0]
+        print(f"[INFO] Using first column '{symbol_col}' as universe symbols")
+
+    symbols = (
+        df[symbol_col]
         .dropna()
         .astype(str)
         .apply(normalize_symbol)
         .unique()
         .tolist()
     )
+
+    symbols = [s for s in symbols if s and s.upper() != "NAN"]
+
+    if not symbols:
+        raise ValueError("No valid symbols found in universe file.")
+
+    return symbols
 
     # Remove blanks / weirdness
     syms = [s for s in syms if s and s != "NAN"]
